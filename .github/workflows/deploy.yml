@@ -343,13 +343,65 @@ jobs:
             echo "T1_OUT_$k=$v" >> "$GITHUB_ENV"
           done
 
+      # Code deploys to the Flex Consumption Function Apps WITHOUT any host key (Omar P2B: host keys bypass Easy Auth,
+      # so host/listkeys, hostruntime, functions/listkeys and listsecrets stay denied to this identity). The Azure CLI's
+      # config-zip does the same OneDeploy upload and status poll as below, then reads the master key for a health
+      # check, which this role refuses. This helper keeps the upload and the status poll and replaces the key check
+      # with the ARM function list (sites/functions/read). Entra token for App Service (the CLI's own audience), no
+      # publishing credentials. Fails closed on anything but OneDeploy 202 and deployment status 4 (Success).
+      - name: Write the key-free Function App deploy helper
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/flex-deploy.sh" <<'SH'
+          set -euo pipefail
+          rg="$1"; app="$2"; zip="$3"
+          [[ "$app" =~ ^[A-Za-z0-9-]+$ && -f "$zip" ]] || { echo "bad app name, or $zip is missing"; exit 1; }
+          # KF-2: text from Kudu is printed only inside stop-commands, so it can never act as a workflow command.
+          quoted() { local t; t="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"; echo "::stop-commands::$t"; cat; echo; echo "::$t::"; }
+          # KF-4: the deployment host must be this app's own.
+          scm="$(az functionapp show -g "$rg" -n "$app" --query "hostNameSslStates[?hostType=='Repository'].name | [0]" -o tsv)"
+          [[ "$scm" == "$app.scm.azurewebsites.net" ]] || { echo "the deployment (scm) host of $app is not $app.scm.azurewebsites.net"; exit 1; }
+          token="$(az account get-access-token --resource https://appservice.azure.com --query accessToken -o tsv)"
+          echo "::add-mask::$token"
+          # KF-3: the bearer header reaches curl on stdin (-H @-), never on the command line.
+          auth() { printf 'Authorization: Bearer %s\n' "$token"; }
+          status_of() { auth | curl -sS --max-time 30 -o "$RUNNER_TEMP/deploy-status.json" -w '%{http_code}' -H @- "https://$scm/api/deployments/latest" || echo 000; }
+          # KF-1: only a 404 means "no earlier deployment"; any other answer stops here, so an old success is never taken as new.
+          first="$(status_of)"
+          case "$first" in
+            200) before="$(jq -r '.id // ""' "$RUNNER_TEMP/deploy-status.json")"; [[ -n "$before" ]] || { echo "$app: the latest deployment has no id"; exit 1; } ;;
+            404) before="" ;;
+            *) echo "$app: could not read the latest deployment before the upload ($first)"; exit 1 ;;
+          esac
+          code="$(auth | curl -sS --max-time 900 -o "$RUNNER_TEMP/publish.out" -w '%{http_code}' -X POST "https://$scm/api/publish?RemoteBuild=false&Deployer=vq_platform_deploy" \
+            -H @- -H "Content-Type: application/zip" -H "Cache-Control: no-cache" --data-binary "@$zip" || echo 000)"
+          [[ "$code" == "202" ]] || { echo "OneDeploy refused the package for $app ($code)"; head -c 2000 "$RUNNER_TEMP/publish.out" 2>/dev/null | quoted || true; exit 1; }
+          for _ in $(seq 1 120); do
+            sleep 5
+            [[ "$(status_of)" == "200" ]] || continue
+            id="$(jq -r '.id // ""' "$RUNNER_TEMP/deploy-status.json")"; status="$(jq -r '.status // ""' "$RUNNER_TEMP/deploy-status.json")"
+            [[ -n "$id" && "$id" != "$before" ]] || continue
+            case "$status" in
+              4) echo "$app: deployment $id succeeded"; break ;;
+              3|-1|5|6) echo "$app: deployment $id ended with status $status"; jq -r '.status_text // empty, .log_url // empty' "$RUNNER_TEMP/deploy-status.json" | quoted; exit 1 ;;
+            esac
+          done
+          [[ "${status:-}" == "4" && -n "${id:-}" && "$id" != "$before" ]] || { echo "$app: the deployment did not finish in 10 minutes"; exit 1; }
+          for _ in $(seq 1 60); do
+            n="$(az functionapp function list -g "$rg" -n "$app" --query "length(@)" -o tsv 2>/dev/null || echo 0)"
+            [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 ]] && { echo "$app: $n function(s) indexed"; exit 0; }
+            sleep 5
+          done
+          echo "$app: no function was indexed within 5 minutes of the deployment"; exit 1
+          SH
+
       # Forward-only, backward-compatible migrations (expand, then contract), before the code is switched.
       # The runner lives inside the VNet (SQL is private) under the migration identity; it answers only an Entra
       # token for its own registration issued to THIS deploy identity.
       - name: Migration job (migration identity, inside the VNet)
         run: |
           set -euo pipefail
-          az functionapp deployment source config-zip -g "$T1_RESOURCE_GROUP" -n "$T1_OUT_migrateName" --src unpacked/migrate.zip > /dev/null
+          bash "$RUNNER_TEMP/flex-deploy.sh" "$T1_RESOURCE_GROUP" "$T1_OUT_migrateName" unpacked/migrate.zip
           token="$(az account get-access-token --resource "api://$T1_MIGRATION_AUTH_CLIENT_ID" --query accessToken -o tsv)"
           echo "::add-mask::$token"
           body="$(jq -n --arg digest "$ARTIFACT_DIGEST" --arg environment "$ENV_NAME" '{digest: $digest, environment: $environment}')"
@@ -361,7 +413,7 @@ jobs:
       - name: Deploy the API code
         run: |
           set -euo pipefail
-          az functionapp deployment source config-zip -g "$T1_RESOURCE_GROUP" -n "$T1_OUT_apiName" --src unpacked/api.zip > /dev/null
+          bash "$RUNNER_TEMP/flex-deploy.sh" "$T1_RESOURCE_GROUP" "$T1_OUT_apiName" unpacked/api.zip
           echo "API deployed: $T1_OUT_apiName" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # The site goes up with the PLATFORM's sign-in configuration (Entra on every route, /api/* included, signed in
