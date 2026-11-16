@@ -359,7 +359,7 @@ jobs:
           # KF-2: text from Kudu is printed only inside stop-commands, so it can never act as a workflow command.
           quoted() { local t; t="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"; echo "::stop-commands::$t"; cat; echo; echo "::$t::"; }
           # KF-4: the deployment host must be this app's own.
-          scm="$(az functionapp show -g "$rg" -n "$app" --query "hostNameSslStates[?hostType=='Repository'].name | [0]" -o tsv)"
+          scm="$(az webapp show -g "$rg" -n "$app" --query "hostNameSslStates[?hostType=='Repository'].name | [0]" -o tsv)"
           [[ "$scm" == "$app.scm.azurewebsites.net" ]] || { echo "the deployment (scm) host of $app is not $app.scm.azurewebsites.net"; exit 1; }
           token="$(az account get-access-token --resource https://appservice.azure.com --query accessToken -o tsv)"
           echo "::add-mask::$token"
@@ -448,7 +448,7 @@ jobs:
           set -euo pipefail
           site="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "https://$T1_OUT_swaHostname/api/health")"
           [[ "$site" == "302" || "$site" == "401" ]] || { echo "/api/health answered $site signed out"; exit 1; }
-          direct="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "https://$(az functionapp show -g "$T1_RESOURCE_GROUP" -n "$T1_OUT_apiName" --query defaultHostName -o tsv)/api/health")"
+          direct="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "https://$(az webapp show -g "$T1_RESOURCE_GROUP" -n "$T1_OUT_apiName" --query defaultHostName -o tsv)/api/health")"
           [[ "$direct" == "401" || "$direct" == "403" ]] || { echo "the Function App answered $direct without the link"; exit 1; }
           runner="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST "https://$T1_OUT_migrateHostname/api/migrate")"
           [[ "$runner" == "401" ]] || { echo "the migration runner answered $runner signed out"; exit 1; }
