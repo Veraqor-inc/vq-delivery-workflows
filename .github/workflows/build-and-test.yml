@@ -1,0 +1,137 @@
+# The platform's reusable build-and-test workflow (M12 P1, F32; design team/m12-customer-delivery.md 4.3,
+# security rules S12-3). It is published as .github/workflows/build-and-test.yml in the platform's public
+# workflow repository, and every solution repository calls it by FULL COMMIT SHA (see caller-example.yml).
+# It is kept here as a template; its rules are checked by test/ci-template.test.ts.
+#
+# What it holds to:
+#  - no identity: permissions {} for the workflow, contents: read for the job, no id-token, no secrets,
+#    no environment. It runs AI-written code, so it gets nothing worth stealing.
+#  - every action pinned by full commit SHA (the tag is only a comment);
+#  - package hygiene: npm ci --ignore-scripts against the public registry, dotnet restore in locked mode
+#    against nuget.org only;
+#  - SQL Server 2022 started from a STEP (not a service container) with a password generated for this one
+#    run and masked, then a health wait (proven in spike G1, team/spikes/m12-p0-g1.md);
+#  - the test report (trx and JUnit XML) uploaded as the artifact "test-report", kept 30 days, which the
+#    engine reads to count passed, failed and skipped tests;
+#  - 30 minutes at most.
+name: build-and-test
+
+on:
+  workflow_call:
+    inputs:
+      node-directory:
+        description: Folder with package.json and package-lock.json ("" for none)
+        type: string
+        default: ""
+      dotnet-solution:
+        description: The .sln or .slnx file to build and test ("" for none)
+        type: string
+        default: ""
+      sql:
+        description: Start SQL Server 2022 for integration tests
+        type: boolean
+        default: false
+      connection-setting:
+        description: Name of the setting the tests read the SQL connection string from
+        type: string
+        default: ConnectionStrings__Default
+
+permissions: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      TEST_RESULTS: ${{ github.workspace }}/test-results
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      NODE_DIR: ${{ inputs.node-directory }}
+      DOTNET_SOLUTION: ${{ inputs.dotnet-solution }}
+      CONNECTION_SETTING: ${{ inputs.connection-setting }}
+    steps:
+      # The whole repository (shared test vectors and repo-root files are needed, spike G1).
+      - name: Check out
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Check inputs
+        run: |
+          mkdir -p "$TEST_RESULTS"
+          [[ -z "$NODE_DIR" || "$NODE_DIR" =~ ^[A-Za-z0-9._/-]{1,100}$ ]] || { echo "node-directory is not a plain path"; exit 1; }
+          [[ -z "$DOTNET_SOLUTION" || "$DOTNET_SOLUTION" =~ ^[A-Za-z0-9._/-]{1,150}\.slnx?$ ]] || { echo "dotnet-solution is not a .sln or .slnx path"; exit 1; }
+          [[ "$CONNECTION_SETTING" =~ ^[A-Za-z][A-Za-z0-9_]{0,80}$ ]] || { echo "connection-setting is not a setting name"; exit 1; }
+
+      - name: Set up Node.js
+        if: inputs.node-directory != ''
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+
+      - name: Node.js install (lock file, no install scripts), lint, build and tests
+        if: inputs.node-directory != ''
+        working-directory: ${{ inputs.node-directory }}
+        run: |
+          test -f package-lock.json || { echo "package-lock.json is required"; exit 1; }
+          npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/
+          npm run lint --if-present
+          npm run build --if-present
+          npm test -- --reporter=default --reporter=junit --outputFile="$TEST_RESULTS/node-junit.xml"
+
+      - name: Set up .NET
+        if: inputs.dotnet-solution != ''
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: .NET restore (lock file required, nuget.org only)
+        if: inputs.dotnet-solution != ''
+        run: dotnet restore "$DOTNET_SOLUTION" --locked-mode --source https://api.nuget.org/v3/index.json
+
+      # A password made up for this run only, masked in the log, never stored. SQL Server is started from a
+      # step (not a service container) because a service container starts before any step can make it.
+      # The image is pinned by digest (Omar P1-12), read from mcr.microsoft.com on 15 Nov 2026 for 2022-latest
+      # (= 2022-CU28-ubuntu-22.04). Refresh it monthly: same tag, new digest from the registry.
+      - name: Start SQL Server 2022 (one-run password)
+        if: inputs.sql
+        run: |
+          pw="$(openssl rand -base64 24 | tr -d '+/=')Aa1"
+          echo "::add-mask::$pw"
+          echo "MSSQL_SA_PASSWORD=$pw" >> "$GITHUB_ENV"
+          MSSQL_SA_PASSWORD="$pw" docker run -d --name sql -e ACCEPT_EULA=Y -e MSSQL_PID=Developer -e MSSQL_SA_PASSWORD -p 1433:1433 mcr.microsoft.com/mssql/server:2022-CU28-ubuntu-22.04@sha256:4525e3efac9f3e241cb003bb2ff2a82818b502f37e12049d788b1a9fa7e13b7f
+
+      - name: Wait for SQL Server
+        if: inputs.sql
+        run: |
+          for i in $(seq 1 90); do
+            if docker exec -e SQLCMDPASSWORD="$MSSQL_SA_PASSWORD" sql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -b -l 2 -Q "SELECT 1" > /dev/null 2>&1; then
+              echo "SQL Server is ready (attempt $i)"
+              echo "$CONNECTION_SETTING=Server=localhost,1433;User ID=sa;Password=$MSSQL_SA_PASSWORD;Encrypt=True;TrustServerCertificate=True;" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "SQL Server did not become ready"
+          exit 1
+
+      - name: .NET build and tests
+        if: inputs.dotnet-solution != ''
+        run: |
+          dotnet build "$DOTNET_SOLUTION" --no-restore -c Release
+          dotnet test "$DOTNET_SOLUTION" --no-build -c Release --logger trx --results-directory "$TEST_RESULTS"
+
+      - name: Upload the test report
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: test-report
+          path: test-results/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Stop SQL Server
+        if: always() && inputs.sql
+        run: docker rm -f sql > /dev/null 2>&1 || true

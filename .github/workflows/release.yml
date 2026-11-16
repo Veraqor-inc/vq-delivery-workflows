@@ -1,0 +1,221 @@
+# The platform's reusable RELEASE workflow (M12 P2, F34; design team/m12-customer-delivery.md 6.2; Omar S12-3,
+# S12-4). Published as .github/workflows/release.yml in the platform's public workflow repository; every solution
+# repository calls it by FULL COMMIT SHA on each push to main (see caller-example.yml). Kept here as a template;
+# its rules are checked by test/release-workflows.test.ts.
+#
+# Build ONCE, deploy many: this is the only place a release is built. The deploy workflow never builds; it
+# downloads this run's artifact, checks its digest and its attestation (signer = THIS workflow), and deploys it.
+#
+# Two jobs, so that no job that runs the solution's code ever holds an identity:
+#  - build:  checks out and builds the merge commit (site, API, migration runner), runs the tests, makes an SBOM,
+#            and packs one file, release.tar. Permissions contents: read only: no id-token, no secrets, no
+#            environment, no Azure.
+#  - attest: never checks out or runs the solution's code. It downloads release.tar, checks its digest against the
+#            build job's, and signs build provenance and the SBOM for it (actions/attest-*). This needs id-token:
+#            write for Sigstore's signing certificate only: the token names no environment and this workflow, so no
+#            Azure federated credential (environment subject + the deploy workflow's job_workflow_ref) can match it.
+#
+# release.tar holds: site.zip, api.zip, migrate.zip, sbom.spdx.json, test-results/ and manifest.json. Its
+# sha256 digest is the release's one identity: the engine records it and every deploy log prints it (D6).
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      site-directory:
+        description: Folder of the web front end (package.json and package-lock.json)
+        type: string
+        required: true
+      site-output:
+        description: The front end's build output folder, relative to site-directory
+        type: string
+        default: dist
+      api-runtime:
+        description: dotnet-isolated or node
+        type: string
+        default: dotnet-isolated
+      api-path:
+        description: The API project (.csproj) or Node folder
+        type: string
+        required: true
+      migrate-path:
+        description: The migration runner project (.csproj) or Node folder
+        type: string
+        required: true
+      dotnet-solution:
+        description: The .sln or .slnx whose tests run on the release build ("" for none)
+        type: string
+        default: ""
+    outputs:
+      digest:
+        description: sha256 digest of release.tar (sha256:<64 hex>)
+        value: ${{ jobs.attest.outputs.digest }}
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.pack.outputs.digest }}
+    env:
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      SITE_DIR: ${{ inputs.site-directory }}
+      SITE_OUT: ${{ inputs.site-output }}
+      API_RUNTIME: ${{ inputs.api-runtime }}
+      API_PATH: ${{ inputs.api-path }}
+      MIGRATE_PATH: ${{ inputs.migrate-path }}
+      DOTNET_SOLUTION: ${{ inputs.dotnet-solution }}
+      OUT: ${{ github.workspace }}/release-out
+    steps:
+      - name: Check out
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Check inputs
+        run: |
+          set -euo pipefail
+          path='^[A-Za-z0-9._/-]{1,150}$'
+          [[ "$SITE_DIR" =~ $path && "$SITE_OUT" =~ $path ]] || { echo "site-directory and site-output must be plain paths"; exit 1; }
+          [[ "$API_RUNTIME" == "dotnet-isolated" || "$API_RUNTIME" == "node" ]] || { echo "api-runtime must be dotnet-isolated or node"; exit 1; }
+          [[ "$API_PATH" =~ $path && "$MIGRATE_PATH" =~ $path ]] || { echo "api-path and migrate-path must be plain paths"; exit 1; }
+          [[ -z "$DOTNET_SOLUTION" || "$DOTNET_SOLUTION" =~ ^[A-Za-z0-9._/-]{1,150}\.slnx?$ ]] || { echo "dotnet-solution is not a .sln or .slnx path"; exit 1; }
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || { echo "a release is built from main only"; exit 1; }
+          mkdir -p "$OUT/test-results"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+
+      - name: Set up .NET
+        if: inputs.api-runtime == 'dotnet-isolated'
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build the site (lock file, no install scripts)
+        working-directory: ${{ inputs.site-directory }}
+        run: |
+          set -euo pipefail
+          test -f package-lock.json || { echo "package-lock.json is required"; exit 1; }
+          npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/
+          npm run build
+          npm test --if-present -- --reporter=default --reporter=junit --outputFile="$OUT/test-results/site-junit.xml"
+          (cd "$SITE_OUT" && zip -qr "$OUT/site.zip" .)
+
+      - name: Build the API and the migration runner (.NET)
+        if: inputs.api-runtime == 'dotnet-isolated'
+        run: |
+          set -euo pipefail
+          if [[ -n "$DOTNET_SOLUTION" ]]; then
+            dotnet restore "$DOTNET_SOLUTION" --locked-mode --source https://api.nuget.org/v3/index.json
+            dotnet test "$DOTNET_SOLUTION" -c Release --logger trx --results-directory "$OUT/test-results"
+          fi
+          for part in api migrate; do
+            project="$API_PATH"; [[ "$part" == "migrate" ]] && project="$MIGRATE_PATH"
+            dotnet restore "$project" --locked-mode --source https://api.nuget.org/v3/index.json
+            dotnet publish "$project" --no-restore -c Release -o "$RUNNER_TEMP/$part"
+            (cd "$RUNNER_TEMP/$part" && zip -qr "$OUT/$part.zip" .)
+          done
+
+      - name: Build the API and the migration runner (Node)
+        if: inputs.api-runtime == 'node'
+        run: |
+          set -euo pipefail
+          for part in api migrate; do
+            dir="$API_PATH"; [[ "$part" == "migrate" ]] && dir="$MIGRATE_PATH"
+            test -f "$dir/package-lock.json" || { echo "$dir/package-lock.json is required"; exit 1; }
+            (cd "$dir" \
+              && npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/ \
+              && npm run build --if-present \
+              && npm test --if-present -- --reporter=default --reporter=junit --outputFile="$OUT/test-results/$part-junit.xml" \
+              && npm prune --omit=dev --ignore-scripts \
+              && zip -qr "$OUT/$part.zip" . -x '.git/*' 'test/*' 'tests/*')
+          done
+
+      - name: Make the SBOM (SPDX)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .
+          format: spdx-json
+          output-file: release-out/sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Pack release.tar and record its digest
+        id: pack
+        run: |
+          set -euo pipefail
+          cd "$OUT"
+          for f in site.zip api.zip migrate.zip sbom.spdx.json; do [[ -f "$f" && ! -L "$f" && -s "$f" ]] || { echo "$f is missing or not a regular file"; exit 1; }; done
+          # P2A-12 / P2B-8 (fix round 1): test-results/ keeps regular files and folders only. Anything else a solution's
+          # tests left there (a link, a pipe) is dropped here and named in the log, so the engine (which refuses any
+          # other member type) and the deploy job always see the same, regular, content.
+          find test-results -mindepth 1 ! -type f ! -type d -print -delete | sed 's/^/dropped (not a regular file): /'
+          jq -n --arg commit "$GITHUB_SHA" --arg repo "$GITHUB_REPOSITORY" --arg run "$GITHUB_RUN_ID" \
+            --arg site "$(sha256sum site.zip | cut -d' ' -f1)" --arg api "$(sha256sum api.zip | cut -d' ' -f1)" \
+            --arg migrate "$(sha256sum migrate.zip | cut -d' ' -f1)" --arg sbom "$(sha256sum sbom.spdx.json | cut -d' ' -f1)" \
+            '{commit: $commit, repository: $repo, run: $run, files: {"site.zip": $site, "api.zip": $api, "migrate.zip": $migrate, "sbom.spdx.json": $sbom}}' > manifest.json
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@0' -cf "$GITHUB_WORKSPACE/release.tar" site.zip api.zip migrate.zip sbom.spdx.json manifest.json test-results
+          digest="sha256:$(sha256sum "$GITHUB_WORKSPACE/release.tar" | cut -d' ' -f1)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Release digest: $digest (commit $GITHUB_SHA)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release.tar
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: release
+          path: release.tar
+          # Short-lived on purpose: dev and qa use it in this run, and the engine copies it to the platform release
+          # store (by digest) when it records release.built. Promotions and rollbacks fetch it from there (P2A-8).
+          retention-days: 30
+          if-no-files-found: error
+
+  attest:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.check.outputs.digest }}
+    env:
+      BUILT_DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - name: Download release.tar (no checkout: no solution code runs here)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+
+      - name: Check the digest matches the build
+        id: check
+        run: |
+          set -euo pipefail
+          digest="sha256:$(sha256sum release.tar | cut -d' ' -f1)"
+          [[ "$digest" == "$BUILT_DIGEST" ]] || { echo "digest mismatch: built $BUILT_DIGEST, downloaded $digest"; exit 1; }
+          # P2A-12 / P2B-8 (fix round 1): before anything is extracted, every member is a regular file or folder, and no
+          # name appears twice (also not as ./name): the same rules the engine applies when it records the release.
+          bad="$(tar -tvf release.tar | cut -c1 | grep -v '^[-d]$' || true)"
+          [[ -z "$bad" ]] || { echo "release.tar holds a member that is not a regular file or folder"; exit 1; }
+          dups="$(tar -tf release.tar | sed -e 's#^\(\./\)*##' -e 's#/*$##' | grep -v '^$' | sort | uniq -d || true)"
+          [[ -z "$dups" ]] || { echo "release.tar holds two members with the same name"; exit 1; }
+          tar -xf release.tar --no-same-owner --no-same-permissions sbom.spdx.json
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release.tar
+
+      - name: Attest the SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: release.tar
+          sbom-path: sbom.spdx.json

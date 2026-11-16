@@ -1,0 +1,407 @@
+# The platform's reusable DEPLOY workflow (M12 P2, F34-F37; design team/m12-customer-delivery.md 6.2-6.4; Omar
+# S12-1, S12-4, S12-5, S12-6, S12-13, P2A-1..P2A-13). Published as .github/workflows/deploy.yml in the platform's
+# public workflow repository, next to release.yml and solution/t1/ (the T1 template). Every solution repository
+# calls it by FULL COMMIT SHA (caller-example.yml). Its rules are checked by test/release-workflows.test.ts.
+#
+# One job per environment. The order is the control, top to bottom:
+#   1. check the inputs and the platform's fixed endpoints: dev and qa deploy only on a push to main, uat and prod
+#      only on the engine's repository_dispatch; rollback only in uat or prod; main only;
+#   2. check that this job really runs the platform's deploy.yml at the pinned commit (from the job's own OIDC
+#      token), so platform-repository and platform-sha can be trusted for the checkout and the signer allow-list;
+#   3. uat and prod: the ENGINE RELEASE GATE, first, before anything touches Azure. The job's own OIDC token
+#      (audience = the gate) and this run's id, attempt, environment and digest go to the engine; anything but an
+#      explicit "go" fails the job here. The go names the release's merge commit and signer. prod then asks the
+#      independent verifier (S12-13): mandatory once RELEASE_VERIFIER_REQUIRED is "true" (P4), never silently
+#      skipped;
+#   4. get release.tar: dev and qa from this run's artifact; uat and prod from the platform release store, by
+#      digest (so a promotion or rollback never depends on Actions artifact retention, P2A-8);
+#   5. check its digest and its attestation: signer = the platform's release.yml at an allowed commit
+#      (--signer-digest), built from refs/heads/main at the release's merge commit (--source-digest), on a
+#      GitHub-hosted runner; the manifest's commit is the merge commit (P2A-3);
+#   6. check out the PLATFORM's template at the pinned commit (never the solution repository);
+#   7. only now sign in to Azure (OIDC, this environment's deploy identity; no secret anywhere);
+#   8. what-if and deploy the T1 template; 9. run the migration job (migration identity, inside the VNet);
+#  10. deploy the API code, then the site with the platform's own sign-in configuration; 11. smoke test.
+#
+# The deploy job never checks out the solution repository, restores caches or runs build tools (S12-4c). Every input
+# reaches a shell only through env and is checked first. The per-environment identifiers are the GitHub environment's
+# VARIABLES, set by the environment owner (not secrets; nothing secret exists).
+name: deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: dev, qa, uat or prod
+        type: string
+        required: true
+      release-run-id:
+        description: The workflow run that built release.tar (the release run)
+        type: string
+        required: true
+      artifact-digest:
+        description: sha256:<64 hex> of release.tar, as the release run (dev, qa) or the engine (uat, prod) recorded it
+        type: string
+        required: true
+      platform-repository:
+        description: owner/name of the platform workflow repository (checked against this job's own OIDC token)
+        type: string
+        required: true
+      platform-sha:
+        description: The full commit SHA of the platform repository this workflow is called at (checked the same way)
+        type: string
+        required: true
+      release-id:
+        description: The engine's release ID (uat, prod)
+        type: string
+        default: ""
+      dispatch-id:
+        description: The engine's dispatch ID for this promotion (uat, prod)
+        type: string
+        default: ""
+      rollback:
+        description: Roll back to this release (uat, prod; the engine allows only the previous release, N-1)
+        type: boolean
+        default: false
+
+permissions: {}
+
+# FIXED BY THE PLATFORM (Omar P2A-1). The gate, release store and verifier addresses and audiences are part of
+# this file, never inputs or repository variables: a solution repository cannot change them, and changing them
+# here changes this file's commit, which the Azure federated subject and the gate's allow-list both name
+# (job_workflow_ref = deploy.yml@<commit>). The __...__ values are filled in when this file is published to the
+# platform repository; left unfilled, every uat and prod deploy stops at "Check inputs". None is secret.
+env:
+  RELEASE_GATE_URL: https://ca-vqbench-engine.salmonforest-4a62aca0.westus3.azurecontainerapps.io/release/gate
+  RELEASE_GATE_AUDIENCE: api://vq-release-gate
+  RELEASE_STORE_URL: https://ca-vqbench-engine.salmonforest-4a62aca0.westus3.azurecontainerapps.io/release/artifact
+  RELEASE_STORE_AUDIENCE: api://vq-release-store
+  # S12-13: empty until the independent verifier exists. Set REQUIRED to "true" before production holds real data
+  # (P4); production then fails closed without a verifier go (P2A-10).
+  RELEASE_VERIFIER_URL: ""
+  RELEASE_VERIFIER_AUDIENCE: ""
+  RELEASE_VERIFIER_REQUIRED: "false"
+  # Earlier platform commits whose release.yml may have signed a release still being promoted or rolled back (N-1
+  # across a platform update), space-separated full SHAs. This file's own commit is always allowed (P2A-3).
+  RELEASE_SIGNER_PREVIOUS_SHAS: ""
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+      attestations: read
+    env:
+      ENV_NAME: ${{ inputs.environment }}
+      RELEASE_RUN_ID: ${{ inputs.release-run-id }}
+      ARTIFACT_DIGEST: ${{ inputs.artifact-digest }}
+      PLATFORM_REPOSITORY: ${{ inputs.platform-repository }}
+      PLATFORM_SHA: ${{ inputs.platform-sha }}
+      RELEASE_ID: ${{ inputs.release-id }}
+      DISPATCH_ID: ${{ inputs.dispatch-id }}
+      ROLLBACK: ${{ inputs.rollback }}
+      # This environment's own identifiers (GitHub environment variables, set by the environment owner).
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      T1_RESOURCE_GROUP: ${{ vars.T1_RESOURCE_GROUP }}
+      T1_SOLUTION: ${{ vars.T1_SOLUTION }}
+      T1_LOCATION: ${{ vars.T1_LOCATION }}
+      T1_IDENTITY_RESOURCE_GROUP: ${{ vars.T1_IDENTITY_RESOURCE_GROUP }}
+      T1_APP_IDENTITY_NAME: ${{ vars.T1_APP_IDENTITY_NAME }}
+      T1_MIGRATION_IDENTITY_NAME: ${{ vars.T1_MIGRATION_IDENTITY_NAME }}
+      T1_SITE_IDENTITY_NAME: ${{ vars.T1_SITE_IDENTITY_NAME }}
+      T1_SITE_AUTH_CLIENT_ID: ${{ vars.T1_SITE_AUTH_CLIENT_ID }}
+      T1_DEPLOY_PRINCIPAL_ID: ${{ vars.T1_DEPLOY_PRINCIPAL_ID }}
+      T1_MIGRATION_AUTH_CLIENT_ID: ${{ vars.T1_MIGRATION_AUTH_CLIENT_ID }}
+      T1_SQL_ADMIN_GROUP_ID: ${{ vars.T1_SQL_ADMIN_GROUP_ID }}
+      T1_SQL_ADMIN_GROUP_NAME: ${{ vars.T1_SQL_ADMIN_GROUP_NAME }}
+      T1_API_RUNTIME: ${{ vars.T1_API_RUNTIME }}
+      T1_API_RUNTIME_VERSION: ${{ vars.T1_API_RUNTIME_VERSION }}
+      T1_VNET_PREFIX: ${{ vars.T1_VNET_PREFIX }}
+      T1_NONPROD_DATABASE: ${{ vars.T1_NONPROD_DATABASE }}
+    steps:
+      - name: Check inputs (main only; who may start which environment; the platform's fixed endpoints)
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || { echo "deploys run from main only"; exit 1; }
+          [[ "$ENV_NAME" =~ ^(dev|qa|uat|prod)$ ]] || { echo "environment must be dev, qa, uat or prod"; exit 1; }
+          [[ "$RELEASE_RUN_ID" =~ ^[0-9]{1,20}$ ]] || { echo "release-run-id must be a run number"; exit 1; }
+          [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "artifact-digest must be sha256:<64 hex>"; exit 1; }
+          [[ "$PLATFORM_REPOSITORY" =~ ^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$ ]] || { echo "platform-repository must be owner/name"; exit 1; }
+          [[ "$PLATFORM_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "platform-sha must be a full commit SHA"; exit 1; }
+          [[ "$ROLLBACK" == "true" || "$ROLLBACK" == "false" ]] || { echo "rollback must be true or false"; exit 1; }
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]{1,6}$ ]] || { echo "no run attempt"; exit 1; }
+          [[ "$RELEASE_VERIFIER_REQUIRED" == "true" || "$RELEASE_VERIFIER_REQUIRED" == "false" ]] || { echo "RELEASE_VERIFIER_REQUIRED must be true or false"; exit 1; }
+          for s in $RELEASE_SIGNER_PREVIOUS_SHAS; do [[ "$s" =~ ^[0-9a-f]{40}$ ]] || { echo "RELEASE_SIGNER_PREVIOUS_SHAS must list full commit SHAs"; exit 1; }; done
+          # P2A-1: an audience the platform mints a token for is never Azure's token-exchange audience (in any
+          # cloud), and no two endpoints share one, so a token for one can be used nowhere else.
+          for a in "$RELEASE_GATE_AUDIENCE" "$RELEASE_STORE_AUDIENCE" "$RELEASE_VERIFIER_AUDIENCE"; do
+            [[ "${a,,}" != *azureadtokenexchange* ]] || { echo "an Azure token-exchange audience is never a gate, store or verifier audience"; exit 1; }
+          done
+          https='^https://[A-Za-z0-9.-]+(:[0-9]{2,5})?/[A-Za-z0-9/._-]*$'
+          audience='^[A-Za-z0-9:/._-]{3,200}$'
+          case "$ENV_NAME" in
+            dev|qa)
+              [[ "$GITHUB_EVENT_NAME" == "push" ]] || { echo "dev and qa deploy only after a push to main"; exit 1; }
+              [[ "$ROLLBACK" == "false" ]] || { echo "dev and qa roll forward; rollback is for uat and prod"; exit 1; }
+              # The release was built by this push, by the platform release.yml at this same platform commit.
+              [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "no commit"; exit 1; }
+              { echo "MERGE_COMMIT=$GITHUB_SHA"; echo "SIGNER_SHA=$PLATFORM_SHA"; } >> "$GITHUB_ENV"
+              ;;
+            uat|prod)
+              [[ "$GITHUB_EVENT_NAME" == "repository_dispatch" ]] || { echo "uat and prod deploy only on the engine's promotion"; exit 1; }
+              uuid='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+              [[ "$RELEASE_ID" =~ $uuid && "$DISPATCH_ID" =~ $uuid ]] || { echo "release-id and dispatch-id must be the engine's IDs"; exit 1; }
+              [[ "$RELEASE_GATE_URL" =~ $https && "$RELEASE_STORE_URL" =~ $https ]] || { echo "the platform's gate and release store addresses are not set"; exit 1; }
+              [[ "$RELEASE_GATE_AUDIENCE" =~ $audience && "$RELEASE_STORE_AUDIENCE" =~ $audience ]] || { echo "the platform's gate and release store audiences are not set"; exit 1; }
+              [[ "$RELEASE_GATE_AUDIENCE" != "$RELEASE_STORE_AUDIENCE" ]] || { echo "the gate and the release store need different audiences"; exit 1; }
+              ;;
+          esac
+          if [[ -n "$RELEASE_VERIFIER_URL" ]]; then
+            [[ "$RELEASE_VERIFIER_URL" =~ $https ]] || { echo "the verifier address is not https"; exit 1; }
+            [[ "$RELEASE_VERIFIER_AUDIENCE" =~ $audience ]] || { echo "the verifier needs its own audience"; exit 1; }
+            [[ "$RELEASE_VERIFIER_AUDIENCE" != "$RELEASE_GATE_AUDIENCE" && "$RELEASE_VERIFIER_AUDIENCE" != "$RELEASE_STORE_AUDIENCE" ]] || { echo "the verifier needs its own audience"; exit 1; }
+          fi
+          echo "Deploying release $ARTIFACT_DIGEST to $ENV_NAME (run $GITHUB_RUN_ID, attempt $GITHUB_RUN_ATTEMPT)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The job's own OIDC token says which workflow file and commit is running (job_workflow_ref, job_workflow_sha).
+      # It must be the platform's deploy.yml at platform-sha, so the checkout and the signer allow-list below cannot
+      # be pointed at another commit by the caller. The token is read here only and never sent anywhere.
+      - name: Check this job runs the platform deploy workflow at the pinned commit
+        run: |
+          set -euo pipefail
+          token="$(curl -sSf --max-time 20 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=platform-self-check" | jq -r '.value')"
+          [[ -n "$token" && "$token" != "null" ]] || { echo "no OIDC token"; exit 1; }
+          echo "::add-mask::$token"
+          payload="$(cut -d. -f2 <<<"$token" | tr '_-' '/+')"
+          while (( ${#payload} % 4 )); do payload+="="; done
+          claims="$(base64 -d <<<"$payload")"
+          ref="$(jq -r '.job_workflow_ref // ""' <<<"$claims")"; sha="$(jq -r '.job_workflow_sha // ""' <<<"$claims")"
+          [[ "$ref" == "$PLATFORM_REPOSITORY/.github/workflows/deploy.yml@$PLATFORM_SHA" && "$sha" == "$PLATFORM_SHA" ]] || { echo "this job does not run $PLATFORM_REPOSITORY deploy.yml at $PLATFORM_SHA (it runs $ref)"; exit 1; }
+
+      # S12-1, D7: the engine answers go only with approved cards bound to THIS run attempt, environment and digest,
+      # from named approvers who are not the requester (prod: two different people); one go per promotion. Fails
+      # closed: no answer, any other answer or any error stops the job here, before the Azure sign-in further down.
+      - name: Engine release gate (uat and prod, before any Azure sign-in)
+        if: inputs.environment == 'uat' || inputs.environment == 'prod'
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_GATE_AUDIENCE,,}" != *azureadtokenexchange* ]] || { echo "refused: Azure token-exchange audience"; exit 1; }
+          token="$(curl -sSf --max-time 20 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$RELEASE_GATE_AUDIENCE" | jq -r '.value')"
+          [[ -n "$token" && "$token" != "null" ]] || { echo "no OIDC token for the gate"; exit 1; }
+          echo "::add-mask::$token"
+          body="$(jq -n --arg releaseId "$RELEASE_ID" --arg dispatchId "$DISPATCH_ID" --arg environment "$ENV_NAME" \
+            --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" --arg artifactDigest "$ARTIFACT_DIGEST" \
+            --argjson rollback "$ROLLBACK" \
+            '{releaseId: $releaseId, dispatchId: $dispatchId, environment: $environment, runId: $runId, runAttempt: $runAttempt, artifactDigest: $artifactDigest, rollback: $rollback}')"
+          code="$(curl -sS --max-time 30 -o gate.json -w '%{http_code}' -X POST "$RELEASE_GATE_URL" \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" --data "$body" || echo 000)"
+          decision="$(jq -r '.decision // "none"' gate.json 2>/dev/null || echo none)"
+          reason="$(jq -r '.reason // "no answer"' gate.json 2>/dev/null || echo "no answer")"
+          merge="$(jq -r '.mergeCommit // ""' gate.json 2>/dev/null || true)"
+          signer="$(jq -r '.signerSha // ""' gate.json 2>/dev/null || true)"
+          rm -f gate.json
+          if [[ "$code" != "200" || "$decision" != "go" ]]; then
+            echo "Release gate: NO-GO ($code): $reason" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          [[ "$merge" =~ ^[0-9a-f]{40}$ && "$signer" =~ ^[0-9a-f]{40}$ ]] || { echo "Release gate: the go names no merge commit or signer: refused"; exit 1; }
+          { echo "MERGE_COMMIT=$merge"; echo "SIGNER_SHA=$signer"; } >> "$GITHUB_ENV"
+          echo "Release gate: GO for $ENV_NAME, digest $ARTIFACT_DIGEST, commit $merge" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # S12-13: required before any production with real data and before any customer production (P4). Same shape
+      # as the gate; its evidence is the approvers' own Entra sign-in, which the engine cannot make. It always runs
+      # for prod: without a verifier it refuses when RELEASE_VERIFIER_REQUIRED is "true", and otherwise says in the
+      # run summary that production rests on the engine gate alone (synthetic data only), never silently (P2A-10).
+      - name: Independent production verifier (prod; mandatory once required)
+        if: inputs.environment == 'prod'
+        run: |
+          set -euo pipefail
+          if [[ -z "$RELEASE_VERIFIER_URL" ]]; then
+            if [[ "$RELEASE_VERIFIER_REQUIRED" == "true" ]]; then echo "Verifier: NO-GO (production requires the independent verifier and none is configured)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+            echo "Verifier: not configured. Production rests on the engine gate alone: allowed only on synthetic data, before P4" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          [[ "${RELEASE_VERIFIER_AUDIENCE,,}" != *azureadtokenexchange* ]] || { echo "refused: Azure token-exchange audience"; exit 1; }
+          token="$(curl -sSf --max-time 20 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$RELEASE_VERIFIER_AUDIENCE" | jq -r '.value')"
+          [[ -n "$token" && "$token" != "null" ]] || { echo "no OIDC token for the verifier"; exit 1; }
+          echo "::add-mask::$token"
+          body="$(jq -n --arg releaseId "$RELEASE_ID" --arg environment "$ENV_NAME" --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" --arg artifactDigest "$ARTIFACT_DIGEST" \
+            '{releaseId: $releaseId, environment: $environment, runId: $runId, runAttempt: $runAttempt, artifactDigest: $artifactDigest}')"
+          code="$(curl -sS --max-time 30 -o verifier.json -w '%{http_code}' -X POST "$RELEASE_VERIFIER_URL" \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" --data "$body" || echo 000)"
+          decision="$(jq -r '.decision // "none"' verifier.json 2>/dev/null || echo none)"
+          rm -f verifier.json
+          [[ "$code" == "200" && "$decision" == "go" ]] || { echo "Verifier: NO-GO ($code)" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; }
+          echo "Verifier: GO" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # dev and qa deploy the artifact of THIS run, minutes after it was built.
+      - name: Download release.tar from this release run (dev and qa)
+        if: inputs.environment == 'dev' || inputs.environment == 'qa'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: release
+          run-id: ${{ inputs.release-run-id }}
+          github-token: ${{ github.token }}
+
+      # P2A-8: uat and prod (and rollback to N-1) fetch the release from the platform release store, BY DIGEST, so a
+      # promotion or rollback weeks later never depends on Actions artifact retention. The engine copies release.tar
+      # there when it records release.built, and serves it only to a run attempt it has just given a go for that
+      # digest (part 2). The digest and the attestation are checked in the next step as for dev and qa.
+      - name: Fetch release.tar from the platform release store by digest (uat and prod)
+        if: inputs.environment == 'uat' || inputs.environment == 'prod'
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_STORE_AUDIENCE,,}" != *azureadtokenexchange* ]] || { echo "refused: Azure token-exchange audience"; exit 1; }
+          token="$(curl -sSf --max-time 20 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$RELEASE_STORE_AUDIENCE" | jq -r '.value')"
+          [[ -n "$token" && "$token" != "null" ]] || { echo "no OIDC token for the release store"; exit 1; }
+          echo "::add-mask::$token"
+          mkdir -p release
+          code="$(curl -sS --max-time 300 -o release/release.tar -w '%{http_code}' -H "Authorization: Bearer $token" \
+            "$RELEASE_STORE_URL/${ARTIFACT_DIGEST#sha256:}" || echo 000)"
+          [[ "$code" == "200" ]] || { echo "the release store answered $code for $ARTIFACT_DIGEST"; exit 1; }
+
+      - name: Verify the digest, the signer, the source and the attestation (signer = the platform release workflow)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          digest="sha256:$(sha256sum release/release.tar | cut -d' ' -f1)"
+          [[ "$digest" == "$ARTIFACT_DIGEST" ]] || { echo "digest mismatch: expected $ARTIFACT_DIGEST, got $digest"; exit 1; }
+          merge="${MERGE_COMMIT:-}"; signer="${SIGNER_SHA:-}"
+          [[ "$merge" =~ ^[0-9a-f]{40}$ ]] || { echo "no merge commit to verify against"; exit 1; }
+          allowed=" $PLATFORM_SHA $RELEASE_SIGNER_PREVIOUS_SHAS "
+          [[ "$signer" =~ ^[0-9a-f]{40}$ && "$allowed" == *" $signer "* ]] || { echo "release.yml at $signer is not an allowed signer"; exit 1; }
+          gh attestation verify release/release.tar \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$PLATFORM_REPOSITORY/.github/workflows/release.yml" \
+            --signer-digest "$signer" \
+            --source-ref refs/heads/main \
+            --source-digest "$merge" \
+            --deny-self-hosted-runners
+          gh attestation verify release/release.tar \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$PLATFORM_REPOSITORY/.github/workflows/release.yml" \
+            --signer-digest "$signer" \
+            --source-ref refs/heads/main \
+            --source-digest "$merge" \
+            --predicate-type https://spdx.dev/Document/v2.3 \
+            --deny-self-hosted-runners > /dev/null
+          # P2A-12 / P2B-8 (fix round 1): before extracting, every member is a regular file or folder and no name appears
+          # twice (also not as ./name). The engine refuses the same, so the engine and this job read the same content.
+          bad="$(tar -tvf release/release.tar | cut -c1 | grep -v '^[-d]$' || true)"
+          [[ -z "$bad" ]] || { echo "release.tar holds a member that is not a regular file or folder"; exit 1; }
+          dups="$(tar -tf release/release.tar | sed -e 's#^\(\./\)*##' -e 's#/*$##' | grep -v '^$' | sort | uniq -d || true)"
+          [[ -z "$dups" ]] || { echo "release.tar holds two members with the same name"; exit 1; }
+          mkdir -p unpacked && tar -xf release/release.tar -C unpacked --no-same-owner --no-same-permissions
+          (cd unpacked && for f in site.zip api.zip migrate.zip sbom.spdx.json; do
+            want="$(jq -r --arg f "$f" '.files[$f]' manifest.json)"; got="$(sha256sum "$f" | cut -d' ' -f1)"
+            [[ "$want" == "$got" ]] || { echo "$f does not match the manifest"; exit 1; }
+          done)
+          commit="$(jq -r '.commit // ""' unpacked/manifest.json)"
+          [[ "$commit" == "$merge" ]] || { echo "the manifest's commit $commit is not the release's merge commit $merge"; exit 1; }
+          echo "Attestation verified for $digest (commit $merge, signed by release.yml at $signer)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Check out the platform template (never the solution repository)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ inputs.platform-repository }}
+          ref: ${{ inputs.platform-sha }}
+          path: platform
+          persist-credentials: false
+          sparse-checkout: solution/t1
+
+      - name: Sign in to Azure (OIDC, this environment's deploy identity)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: What-if and deploy the T1 template
+        run: |
+          set -euo pipefail
+          az account show --query "{subscription: id, tenant: tenantId}" -o tsv
+          params="platform/solution/t1/params/$ENV_NAME.bicepparam"
+          az deployment group what-if -g "$T1_RESOURCE_GROUP" --name "t1-$ENV_NAME-$GITHUB_RUN_ID" --parameters "$params" --no-pretty-print --result-format ResourceIdOnly > whatif.json
+          jq -r '.changes[] | "\(.changeType)\t\(.resourceId)"' whatif.json | tee -a "$GITHUB_STEP_SUMMARY"
+          if jq -e '.changes[] | select(.changeType == "Delete")' whatif.json > /dev/null; then echo "the what-if deletes a resource: refused"; exit 1; fi
+          az deployment group create -g "$T1_RESOURCE_GROUP" --name "t1-$ENV_NAME-$GITHUB_RUN_ID" --parameters "$params" --query properties.outputs -o json > outputs.json
+          for k in apiName migrateName migrateHostname swaName swaHostname; do
+            v="$(jq -r --arg k "$k" '.[$k].value' outputs.json)"; [[ "$v" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "output $k is missing"; exit 1; }
+            echo "T1_OUT_$k=$v" >> "$GITHUB_ENV"
+          done
+
+      # Forward-only, backward-compatible migrations (expand, then contract), before the code is switched.
+      # The runner lives inside the VNet (SQL is private) under the migration identity; it answers only an Entra
+      # token for its own registration issued to THIS deploy identity.
+      - name: Migration job (migration identity, inside the VNet)
+        run: |
+          set -euo pipefail
+          az functionapp deployment source config-zip -g "$T1_RESOURCE_GROUP" -n "$T1_OUT_migrateName" --src unpacked/migrate.zip > /dev/null
+          token="$(az account get-access-token --resource "api://$T1_MIGRATION_AUTH_CLIENT_ID" --query accessToken -o tsv)"
+          echo "::add-mask::$token"
+          body="$(jq -n --arg digest "$ARTIFACT_DIGEST" --arg environment "$ENV_NAME" '{digest: $digest, environment: $environment}')"
+          code="$(curl -sS --max-time 600 -o migrate.json -w '%{http_code}' -X POST "https://$T1_OUT_migrateHostname/api/migrate" \
+            -H "Authorization: Bearer $token" -H "Content-Type: application/json" --data "$body" || echo 000)"
+          [[ "$code" == "200" ]] && jq -e '.ok == true' migrate.json > /dev/null || { echo "migration failed ($code)"; jq -r '.message // empty' migrate.json 2>/dev/null || true; exit 1; }
+          jq -r '"Migrations: \(.applied // 0) applied"' migrate.json | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy the API code
+        run: |
+          set -euo pipefail
+          az functionapp deployment source config-zip -g "$T1_RESOURCE_GROUP" -n "$T1_OUT_apiName" --src unpacked/api.zip > /dev/null
+          echo "API deployed: $T1_OUT_apiName" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The site goes up with the PLATFORM's sign-in configuration (Entra on every route, /api/* included, signed in
+      # with the site's managed identity, no secret), which replaces any configuration file the solution shipped.
+      # The upload token is read here, masked, and never stored.
+      - name: Prepare the site with the platform sign-in configuration
+        run: |
+          set -euo pipefail
+          [[ "$AZURE_TENANT_ID" =~ ^[0-9a-f-]{36}$ ]] || { echo "AZURE_TENANT_ID is not a tenant ID"; exit 1; }
+          mkdir -p site && (cd site && unzip -q ../unpacked/site.zip)
+          find site -name staticwebapp.config.json -delete
+          sed "s/__TENANT_ID__/$AZURE_TENANT_ID/" platform/solution/t1/site/staticwebapp.config.json > site/staticwebapp.config.json
+          swa_token="$(az staticwebapp secrets list -n "$T1_OUT_swaName" -g "$T1_RESOURCE_GROUP" --query properties.apiKey -o tsv)"
+          echo "::add-mask::$swa_token"
+          echo "SWA_UPLOAD_TOKEN=$swa_token" >> "$GITHUB_ENV"
+
+      - name: Deploy the site
+        uses: Azure/static-web-apps-deploy@1a947af9992250f3bc2e68ad0754c0b0c11566c9 # v1
+        with:
+          action: upload
+          azure_static_web_apps_api_token: ${{ env.SWA_UPLOAD_TOKEN }}
+          app_location: site
+          config_file_location: site
+          skip_app_build: true
+          skip_api_build: true
+
+      # Signed out, the site and its /api must refuse (302 to sign-in or 401), the Function App's own address must
+      # refuse without the link's identity (401 or 403), and the migration runner must answer 401 (P2A-13).
+      # Signed-in checks are Aisha's deployed-app tests.
+      - name: Smoke test (signed out, everything refuses)
+        run: |
+          set -euo pipefail
+          site="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "https://$T1_OUT_swaHostname/api/health")"
+          [[ "$site" == "302" || "$site" == "401" ]] || { echo "/api/health answered $site signed out"; exit 1; }
+          direct="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "https://$(az functionapp show -g "$T1_RESOURCE_GROUP" -n "$T1_OUT_apiName" --query defaultHostName -o tsv)/api/health")"
+          [[ "$direct" == "401" || "$direct" == "403" ]] || { echo "the Function App answered $direct without the link"; exit 1; }
+          runner="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST "https://$T1_OUT_migrateHostname/api/migrate")"
+          [[ "$runner" == "401" ]] || { echo "the migration runner answered $runner signed out"; exit 1; }
+          echo "Deployed $ARTIFACT_DIGEST to $ENV_NAME: site $site signed out, direct API $direct, migration runner $runner" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Sign out of Azure
+        if: always()
+        run: az logout || true
